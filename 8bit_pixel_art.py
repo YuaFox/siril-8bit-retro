@@ -21,60 +21,23 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QImage, QPixmap
 from PIL import Image
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 PREVIEW_MAX = 320  # max px for preview thumbnail dimension
 
-# ── Stretch (replica del autostretch MTF de Siril) ────────────────────────────
+# ── Normalización (min/max lineal, como el modo de visualización de Siril) ─────
 #
-# Los datos lineales (p. ej. una toma de 16-bit de M42) tienen casi todo el
-# señal concentrada cerca de 0, así que un simple *255 deja la imagen negra y
-# el cast a uint8 produce ruido. Siril muestra la imagen aplicando una Midtones
-# Transfer Function (MTF) calculada a partir de la mediana y la MAD. Aquí
-# replicamos ese autostretch para que el efecto opere sobre lo que realmente ves.
-
-SHADOWS_CLIP = -2.80   # recorte de sombras en unidades de MAD (igual que PixInsight/Siril)
-TARGET_BG    = 0.25    # fondo objetivo
-
-
-def _mtf(m, x):
-    """Midtones Transfer Function. Acepta escalares o arrays; entrada/salida en [0,1]."""
-    x = np.asarray(x, dtype=np.float64)
-    denom = (2.0 * m - 1.0) * x - m
-    out = np.divide((m - 1.0) * x, denom,
-                    out=np.zeros_like(x), where=np.abs(denom) > 1e-12)
-    return np.clip(out, 0.0, 1.0)
-
-
-def _normalize01(arr_f32, dtype):
-    """Lleva los datos a [0,1] según su tipo original."""
-    if np.issubdtype(dtype, np.integer):
-        return arr_f32 / float(np.iinfo(dtype).max)
-    mx = float(arr_f32.max())
-    return arr_f32 / mx if mx > 1.0 else arr_f32
-
-
-def _auto_stretch(arr01):
-    """Autostretch MTF enlazado sobre un HWC en [0,1]. Devuelve HWC en [0,255].
-
-    Enlazado (mismas sombras/midtones para todos los canales) para preservar
-    el balance de color, como el autostretch por defecto de Siril.
-    """
-    median = float(np.median(arr01))
-    mad = float(np.median(np.abs(arr01 - median))) * 1.4826  # MAD normalizada
-    if mad < 1e-12:
-        mad = 1e-12
-
-    shadows = min(1.0, max(0.0, median + SHADOWS_CLIP * mad))
-    midtones = float(_mtf(TARGET_BG, median - shadows))
-
-    x = np.clip((arr01 - shadows) / max(1.0 - shadows, 1e-12), 0.0, 1.0)
-    return (_mtf(midtones, x) * 255.0).astype(np.float32)
-
+# Las imágenes pueden venir en cualquier rango (16-bit lineal [0,65535], float
+# [0,1], etc.). Un simple *255 + cast a uint8 desborda y produce ruido arcoíris.
+# Un autostretch MTF agresivo, en cambio, revienta objetos brillantes como la
+# Luna a blanco puro. Aquí replicamos el modo "Min/Max + Linear" de Siril:
+# escalamos linealmente entre el mínimo y el máximo globales de la imagen. Es
+# neutro, preserva el color y coincide con lo que ves en pantalla.
 
 def _to_display_hwc(data, dtype):
-    """Datos crudos CHW (cualquier tipo) → HWC float32 en [0,255], autostretcheado.
+    """Datos crudos CHW (cualquier tipo/rango) → HWC float32 en [0,255].
 
+    Escala lineal min/max global (linked) para preservar el balance de color.
     Mono se mantiene como 1 canal (idéntico en preview y en el resultado final).
     """
     arr = data.astype(np.float32)
@@ -82,8 +45,14 @@ def _to_display_hwc(data, dtype):
         arr = np.transpose(arr, (1, 2, 0))   # CHW → HWC
     else:
         arr = arr[:, :, np.newaxis]
-    arr = _normalize01(arr, dtype)
-    return _auto_stretch(arr)
+
+    lo = float(arr.min())
+    hi = float(arr.max())
+    if hi > lo:
+        arr = (arr - lo) / (hi - lo) * 255.0
+    else:
+        arr = np.zeros_like(arr)
+    return arr.astype(np.float32)
 
 
 # ── Efecto 8-bit (numpy puro, HWC float32 en 0–255) ────────────────────────────
@@ -178,7 +147,7 @@ class PixelArtWindow(QMainWindow):
         self.siril = siril
         self._original_data = None  # CHW, tipo original — para el undo
         self._orig_dtype = None
-        self._display_hwc = None    # HWC float32 0-255 full-res (autostretcheado) — apply
+        self._display_hwc = None    # HWC float32 0-255 full-res — apply
         self._thumb_hwc = None      # copia reducida de _display_hwc — preview
         self._thumb_scale = 1.0     # factor de reducción del thumbnail
 
@@ -303,7 +272,7 @@ class PixelArtWindow(QMainWindow):
                 self._original_data = fit.data.copy()   # exacto, para revertir
                 self._orig_dtype = fit.data.dtype
 
-            # Origen común (full-res, autostretcheado) para preview y apply
+            # Origen común (full-res, normalizado a 0-255) para preview y apply
             self._display_hwc = _to_display_hwc(self._original_data, self._orig_dtype)
 
             # Thumbnail = copia reducida del MISMO origen
