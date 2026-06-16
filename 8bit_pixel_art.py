@@ -20,38 +20,84 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QImage, QPixmap
 from PIL import Image
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 PREVIEW_MAX = 320  # max px for preview thumbnail dimension
 
-# ── Normalization ─────────────────────────────────────────────────────────────
+# ── Stretch (replica del autostretch MTF de Siril) ────────────────────────────
+#
+# Los datos lineales (p. ej. una toma de 16-bit de M42) tienen casi todo el
+# señal concentrada cerca de 0, así que un simple *255 deja la imagen negra y
+# el cast a uint8 produce ruido. Siril muestra la imagen aplicando una Midtones
+# Transfer Function (MTF) calculada a partir de la mediana y la MAD. Aquí
+# replicamos ese autostretch para que el efecto opere sobre lo que realmente ves.
 
-def _stretch_to_255(arr):
+SHADOWS_CLIP = -2.80   # recorte de sombras en unidades de MAD (igual que PixInsight/Siril)
+TARGET_BG    = 0.25    # fondo objetivo
+
+
+def _mtf(m, x):
+    """Midtones Transfer Function. Acepta escalares o arrays; entrada/salida en [0,1]."""
+    x = np.asarray(x, dtype=np.float64)
+    denom = (2.0 * m - 1.0) * x - m
+    out = np.divide((m - 1.0) * x, denom,
+                    out=np.zeros_like(x), where=np.abs(denom) > 1e-12)
+    return np.clip(out, 0.0, 1.0)
+
+
+def _normalize01(arr_f32, dtype):
+    """Lleva los datos a [0,1] según su tipo original."""
+    if np.issubdtype(dtype, np.integer):
+        return arr_f32 / float(np.iinfo(dtype).max)
+    mx = float(arr_f32.max())
+    return arr_f32 / mx if mx > 1.0 else arr_f32
+
+
+def _auto_stretch(arr01):
+    """Autostretch MTF enlazado sobre un HWC en [0,1]. Devuelve HWC en [0,255].
+
+    Enlazado (mismas sombras/midtones para todos los canales) para preservar
+    el balance de color, como el autostretch por defecto de Siril.
     """
-    Stretch a float32 HWC array to the [0, 255] range using percentile clipping.
-    Linear astronomical data lives near 0 in a [0, 1] or [0, 65535] range;
-    a simple *255 multiplication leaves everything black.  Percentile clipping
-    maps the meaningful signal to the full display range, matching what Siril
-    shows on screen.
+    median = float(np.median(arr01))
+    mad = float(np.median(np.abs(arr01 - median))) * 1.4826  # MAD normalizada
+    if mad < 1e-12:
+        mad = 1e-12
+
+    shadows = min(1.0, max(0.0, median + SHADOWS_CLIP * mad))
+    midtones = float(_mtf(TARGET_BG, median - shadows))
+
+    x = np.clip((arr01 - shadows) / max(1.0 - shadows, 1e-12), 0.0, 1.0)
+    return (_mtf(midtones, x) * 255.0).astype(np.float32)
+
+
+def _to_display_hwc(data, dtype):
+    """Datos crudos CHW (cualquier tipo) → HWC float32 en [0,255], autostretcheado.
+
+    Mono se mantiene como 1 canal (idéntico en preview y en el resultado final).
     """
-    p_low  = np.percentile(arr, 0.5)
-    p_high = np.percentile(arr, 99.5)
-    if p_high > p_low:
-        arr = np.clip((arr - p_low) / (p_high - p_low) * 255.0, 0, 255)
+    arr = data.astype(np.float32)
+    if arr.ndim == 3:
+        arr = np.transpose(arr, (1, 2, 0))   # CHW → HWC
     else:
-        arr = np.zeros_like(arr)
-    return arr
+        arr = arr[:, :, np.newaxis]
+    arr = _normalize01(arr, dtype)
+    return _auto_stretch(arr)
 
 
-# ── Core effect (pure numpy, HWC float32 0–255) ───────────────────────────────
+# ── Efecto 8-bit (numpy puro, HWC float32 en 0–255) ────────────────────────────
+#
+# UNA sola función usada tanto por el preview como por el resultado final, sobre
+# los mismos datos de origen (el preview solo sobre una copia reducida). Por eso
+# ya no pueden divergir.
 
 def _process_array(arr, pixel_block, color_levels, saturation, contrast,
                    noise_strength, noise_blue, scanline_step, scanline_dim):
-    """Apply the 8-bit effect to a HWC float32 array already in the 0–255 range."""
+    """Aplica el efecto 8-bit a un HWC float32 ya en el rango 0–255."""
     h, w, c = arr.shape
     arr = arr.copy()
 
-    # Contrast & saturation
+    # 1. Contraste y saturación
     mean = arr.mean()
     arr = (arr - mean) * contrast + mean
     if c == 3:
@@ -59,74 +105,34 @@ def _process_array(arr, pixel_block, color_levels, saturation, contrast,
         arr = gray + (arr - gray) * saturation
     arr = np.clip(arr, 0, 255)
 
-    # Pixelation
+    # 2. Pixelado NEAREST
     pil_img = Image.fromarray(arr.astype(np.uint8))
     tw, th = max(1, w // pixel_block), max(1, h // pixel_block)
     small = pil_img.resize((tw, th), Image.NEAREST)
     pixelated = small.resize((w, h), Image.NEAREST)
     arr = np.array(pixelated, dtype=np.float32)
+    if arr.ndim == 2:                       # PIL colapsa el canal único en mono
+        arr = arr[:, :, np.newaxis]
 
-    # Color quantization
+    # 3. Cuantización de color
     step = 256 // color_levels
     arr = (arr // step) * step
     arr = np.clip(arr, 0, 255 - step)
 
-    # Color noise
+    # 4. Ruido de color
     if noise_strength > 0:
         noise = np.random.normal(0, noise_strength, arr.shape).astype(np.float32)
         if c == 3:
             noise[:, :, 2] *= noise_blue
         arr = np.clip(arr + noise, 0, 255)
 
-    # CRT scanlines
+    # 5. Scanlines CRT alineadas al tamaño de bloque
     if scanline_step > 0:
-        step_aligned = pixel_block * scanline_step
+        step_aligned = max(1, pixel_block * scanline_step)
         for y in range(0, h, step_aligned):
             arr[y:y+1, :] = arr[y:y+1, :] * scanline_dim
 
     return arr
-
-
-# ── Siril integration ─────────────────────────────────────────────────────────
-
-def apply_8bit_effect(siril, pixel_block, color_levels, saturation, contrast,
-                      noise_strength, noise_blue, scanline_step, scanline_dim):
-    try:
-        with siril.image_lock():
-            fit = siril.get_image(True)
-            data = fit.data.copy().astype(np.float32)
-
-        siril.log("8-bit Pixel Art: aplicando efecto...")
-
-        # CHW → HWC
-        if data.ndim == 3:
-            arr = np.transpose(data, (1, 2, 0))
-        else:
-            arr = data[:, :, np.newaxis]
-
-        # Percentile stretch so linear data fills the 0-255 display range
-        arr = _stretch_to_255(arr)
-
-        arr = _process_array(arr, pixel_block, color_levels, saturation, contrast,
-                             noise_strength, noise_blue, scanline_step, scanline_dim)
-
-        # Back to [0, 1] and CHW
-        arr = arr / 255.0
-        if data.ndim == 3:
-            result = np.transpose(arr, (2, 0, 1))
-        else:
-            result = arr[:, :, 0]
-
-        result = result.astype(data.dtype)
-
-        with siril.image_lock():
-            siril.set_image_pixeldata(result)
-
-        siril.log("8-bit Pixel Art: ¡listo!")
-
-    except Exception as e:
-        siril.log(f"Error en el script: {e}")
-        raise
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -169,8 +175,11 @@ class PixelArtWindow(QMainWindow):
     def __init__(self, siril):
         super().__init__()
         self.siril = siril
-        self._original_data = None  # CHW original dtype — for undo
-        self._thumb_hwc = None      # HWC float32 0-255 thumbnail — for preview
+        self._original_data = None  # CHW, tipo original — para el undo
+        self._orig_dtype = None
+        self._display_hwc = None    # HWC float32 0-255 full-res (autostretcheado) — apply
+        self._thumb_hwc = None      # copia reducida de _display_hwc — preview
+        self._thumb_scale = 1.0     # factor de reducción del thumbnail
 
         self.setWindowTitle(f"8-bit Pixel Art — v{VERSION}")
         self.setMinimumWidth(720)
@@ -181,7 +190,7 @@ class PixelArtWindow(QMainWindow):
         root.setSpacing(16)
         root.setContentsMargins(16, 16, 16, 16)
 
-        # ── Left: preview ──────────────────────────────────────────────────
+        # ── Izquierda: preview ────────────────────────────────────────────
         self.preview_label = QLabel("Cargando preview...")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setFixedSize(PREVIEW_MAX, PREVIEW_MAX)
@@ -190,7 +199,7 @@ class PixelArtWindow(QMainWindow):
         )
         root.addWidget(self.preview_label, 0)
 
-        # ── Right: controls ────────────────────────────────────────────────
+        # ── Derecha: controles ───────────────────────────────────────────
         ctrl = QWidget()
         layout = QVBoxLayout(ctrl)
         layout.setSpacing(10)
@@ -249,7 +258,7 @@ class PixelArtWindow(QMainWindow):
         sep2.setFrameShape(QFrame.Shape.HLine)
         layout.addWidget(sep2)
 
-        # Buttons
+        # Botones
         btn_row = QHBoxLayout()
         self.btn_apply = QPushButton("Aplicar efecto")
         self.btn_apply.setFixedHeight(36)
@@ -269,7 +278,7 @@ class PixelArtWindow(QMainWindow):
         btn_row.addWidget(btn_close)
         layout.addLayout(btn_row)
 
-        # Debounce timer for preview
+        # Timer de debounce para el preview
         self._preview_timer = QTimer()
         self._preview_timer.setSingleShot(True)
         self._preview_timer.setInterval(150)
@@ -283,33 +292,29 @@ class PixelArtWindow(QMainWindow):
 
         self._load_image()
 
-    # ── Image loading ──────────────────────────────────────────────────────
+    # ── Carga de imagen ──────────────────────────────────────────────────
 
     def _load_image(self):
+        """Captura la imagen original una sola vez y prepara el origen común."""
         try:
             with self.siril.image_lock():
                 fit = self.siril.get_image(True)
-                self._original_data = fit.data.copy()  # original dtype for undo
+                self._original_data = fit.data.copy()   # exacto, para revertir
+                self._orig_dtype = fit.data.dtype
 
-            data_f32 = self._original_data.astype(np.float32)
+            # Origen común (full-res, autostretcheado) para preview y apply
+            self._display_hwc = _to_display_hwc(self._original_data, self._orig_dtype)
 
-            # CHW → HWC
-            if data_f32.ndim == 3:
-                arr = np.transpose(data_f32, (1, 2, 0))
-            else:
-                arr = np.stack([data_f32, data_f32, data_f32], axis=2)
-
-            # Percentile stretch: maps the real signal to 0-255 regardless of
-            # whether the data is linear [0,1], linear [0,65535], or already stretched
-            arr = _stretch_to_255(arr)
-
-            # Downscale to thumbnail
-            h, w, _ = arr.shape
-            scale = min(PREVIEW_MAX / w, PREVIEW_MAX / h, 1.0)
-            tw, th = max(1, int(w * scale)), max(1, int(h * scale))
-            pil = Image.fromarray(arr.astype(np.uint8))
+            # Thumbnail = copia reducida del MISMO origen
+            h, w, _ = self._display_hwc.shape
+            self._thumb_scale = min(PREVIEW_MAX / w, PREVIEW_MAX / h, 1.0)
+            tw, th = max(1, int(w * self._thumb_scale)), max(1, int(h * self._thumb_scale))
+            pil = Image.fromarray(self._display_hwc.astype(np.uint8))
             pil = pil.resize((tw, th), Image.NEAREST)
-            self._thumb_hwc = np.array(pil, dtype=np.float32)
+            thumb = np.array(pil, dtype=np.float32)
+            if thumb.ndim == 2:
+                thumb = thumb[:, :, np.newaxis]
+            self._thumb_hwc = thumb
 
             self._update_preview()
 
@@ -325,10 +330,16 @@ class PixelArtWindow(QMainWindow):
         if self._thumb_hwc is None:
             return
         try:
-            result = _process_array(self._thumb_hwc, **self._params())
+            params = self._params()
+            # El tamaño de bloque va en píxeles: lo escalamos al thumbnail para que
+            # el pixelado se vea proporcional al resultado a resolución completa.
+            params["pixel_block"] = max(1, round(params["pixel_block"] * self._thumb_scale))
+            result = _process_array(self._thumb_hwc, **params)
+
             rgb = result.astype(np.uint8)
             if rgb.shape[2] == 1:
                 rgb = np.repeat(rgb, 3, axis=2)
+            rgb = np.ascontiguousarray(rgb)
             h, w, _ = rgb.shape
             qimg = QImage(rgb.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888)
             self.preview_label.setPixmap(
@@ -355,15 +366,37 @@ class PixelArtWindow(QMainWindow):
             scanline_dim   = self.s_scanline_dim.value(),
         )
 
-    # ── Actions ────────────────────────────────────────────────────────────
+    # ── Acciones ─────────────────────────────────────────────────────────
 
     def apply(self):
+        """Aplica el efecto SIEMPRE desde el origen capturado (idempotente)."""
+        if self._display_hwc is None:
+            return
         self.btn_apply.setEnabled(False)
         self.btn_apply.setText("Procesando...")
         QApplication.processEvents()
         try:
-            apply_8bit_effect(self.siril, **self._params())
+            self.siril.log("8-bit Pixel Art: aplicando efecto...")
+            result = _process_array(self._display_hwc, **self._params())  # HWC [0,255]
+
+            out01 = np.clip(result / 255.0, 0.0, 1.0)
+            # HWC → al formato/rango originales
+            if self._original_data.ndim == 3:
+                out = np.transpose(out01, (2, 0, 1))            # → CHW
+            else:
+                out = out01[:, :, 0]                            # → HW (mono)
+
+            if np.issubdtype(self._orig_dtype, np.integer):
+                out = (out * np.iinfo(self._orig_dtype).max)
+            out = out.astype(self._orig_dtype)
+
+            with self.siril.image_lock():
+                self.siril.set_image_pixeldata(out)
+
+            self.siril.log("8-bit Pixel Art: ¡listo!")
             self.btn_undo.setEnabled(True)
+        except Exception as e:
+            self.siril.log(f"Error en el script: {e}")
         finally:
             self.btn_apply.setEnabled(True)
             self.btn_apply.setText("Aplicar efecto")
@@ -381,7 +414,7 @@ class PixelArtWindow(QMainWindow):
             self.btn_undo.setEnabled(True)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     siril = s.SirilInterface()
