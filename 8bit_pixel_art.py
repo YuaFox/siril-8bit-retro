@@ -1,5 +1,6 @@
 # 8-bit Pixel Art Effect for Siril
-# Author: Claude / Anthropic
+# Author: YuaFox
+# Assisted by: Claude (Anthropic)
 # License: MIT
 # Description: Applies an 8-bit retro pixel art effect to the current image in Siril.
 #              Opens a PyQt6 GUI with live preview and sliders to configure the effect.
