@@ -1,8 +1,6 @@
 # 8-bit Pixel Art Effect for Siril
 
-A Python script for [Siril](https://siril.org) that applies a retro 8-bit pixel art effect to the currently loaded image. A PyQt6 GUI lets you tweak every parameter before the effect is applied.
-
-![Effect preview: pixelation + CRT scanlines on an astro image](https://placehold.co/800x300/0d1117/58a6ff?text=8-bit+Pixel+Art+%E2%80%94+Siril+Script)
+A Python script for [Siril](https://siril.org) that applies a retro 8-bit pixel art effect to the currently loaded image. A PyQt6 GUI with **live preview** lets you fine-tune every parameter before the effect is applied. A **Revert** button restores the original if you don't like the result.
 
 ---
 
@@ -18,6 +16,14 @@ A Python script for [Siril](https://siril.org) that applies a retro 8-bit pixel 
 | **Blue boost** | Extra noise amplification on the blue channel (1× – 4×) |
 | **Scanlines every N blocks** | CRT horizontal-line frequency (0 = off) |
 | **Scanline dimming** | Brightness of the scanline rows (0.1 – 1.0) |
+
+### Live preview
+
+A 320 × 320 thumbnail updates in real time (150 ms debounce) as you move any slider, so you see the result before touching the full-resolution image.
+
+### Undo (one level)
+
+The original pixel data is captured when the window opens. Click **↩ Revertir** at any time to restore the image to its exact pre-effect state.
 
 ---
 
@@ -42,7 +48,7 @@ A Python script for [Siril](https://siril.org) that applies a retro 8-bit pixel 
 
 1. Download both `8bit_pixel_art.py` and `install.ps1` into the **same folder**.
 2. Right-click `install.ps1` and choose **"Run with PowerShell"**.
-   - The script searches the following default locations for Siril's scripts directory:
+   - The script searches the following default locations for Siril’s scripts directory:
      - `%APPDATA%\siril\scripts`
      - `%LOCALAPPDATA%\siril\scripts`
      - `C:\Program Files\Siril\scripts`
@@ -76,17 +82,17 @@ A Python script for [Siril](https://siril.org) that applies a retro 8-bit pixel 
 
 1. Open an image in Siril.
 2. Go to **Tools → Scripts → 8bit_pixel_art**.
-3. A window appears with all sliders.
-4. Adjust the parameters to taste.
-5. Click **"Aplicar efecto"** — the effect is applied to the active image in Siril.
-6. Use **Ctrl+Z** (Edit → Undo) inside Siril to revert if needed.
+3. A window opens with a **live preview** on the left and sliders on the right.
+4. Adjust the parameters — the preview updates automatically.
+5. Click **"Aplicar efecto"** to apply the effect to the full-resolution image in Siril.
+6. Click **"↩ Revertir"** to undo and restore the original image.
 
 ---
 
 ## Parameter guide
 
 ```
-Block size 3 + Color levels 8  →  classic NES/Game Boy look
+Block size 3 + Color levels 8  →  classic NES / Game Boy look
 Block size 2 + Color levels 16 →  SNES / 16-bit feel
 Scanlines every 2 blocks, dimming 0.5  →  CRT monitor simulation
 Noise 10–20 + Blue boost 2.0  →  VHS colour noise
