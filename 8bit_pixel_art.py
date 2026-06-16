@@ -62,7 +62,8 @@ def _to_display_hwc(data, dtype):
 # ya no pueden divergir.
 
 def _process_array(arr, pixel_block, color_levels, saturation, contrast,
-                   noise_strength, noise_blue, scanline_step, scanline_dim):
+                   noise_strength, noise_blue, scanline_step, scanline_dim,
+                   scanline_width=1):
     """Aplica el efecto 8-bit a un HWC float32 ya en el rango 0–255."""
     h, w, c = arr.shape
     arr = arr.copy()
@@ -89,18 +90,28 @@ def _process_array(arr, pixel_block, color_levels, saturation, contrast,
     arr = (arr // step) * step
     arr = np.clip(arr, 0, 255 - step)
 
-    # 4. Ruido de color
+    # 4. Ruido de color a nivel de bloque
     if noise_strength > 0:
-        noise = np.random.normal(0, noise_strength, arr.shape).astype(np.float32)
+        # Generar ruido a resolución de bloque y escalarlo para que todos los
+        # píxeles dentro del mismo bloque reciban el mismo valor de ruido.
+        nh = (h + pixel_block - 1) // pixel_block
+        nw = (w + pixel_block - 1) // pixel_block
+        noise_small = np.random.normal(0, noise_strength, (nh, nw, c)).astype(np.float32)
         if c == 3:
-            noise[:, :, 2] *= noise_blue
-        arr = np.clip(arr + noise, 0, 255)
+            noise_small[:, :, 2] *= noise_blue
+        noise = np.repeat(np.repeat(noise_small, pixel_block, axis=0), pixel_block, axis=1)
+        arr = np.clip(arr + noise[:h, :w], 0, 255)
 
-    # 5. Scanlines CRT alineadas al tamaño de bloque
+    # 5. Scanlines CRT centradas en los límites entre bloques
     if scanline_step > 0:
-        step_aligned = max(1, pixel_block * scanline_step)
-        for y in range(0, h, step_aligned):
-            arr[y:y+1, :] = arr[y:y+1, :] * scanline_dim
+        half_t = scanline_width // 2
+        rest_t = scanline_width - half_t
+        boundary_step = pixel_block * scanline_step
+        for b in range(pixel_block, h + pixel_block, boundary_step):
+            y_start = max(0, b - half_t)
+            y_end = min(h, b + rest_t)
+            if y_start < y_end:
+                arr[y_start:y_end, :] *= scanline_dim
 
     return arr
 
@@ -218,10 +229,12 @@ class PixelArtWindow(QMainWindow):
         # CRT
         grp_crt = QGroupBox("Scanlines CRT")
         gl4 = QVBoxLayout(grp_crt)
-        self.s_scanline_step = SliderRow("Cada N bloques", 0, 10, 2)
-        self.s_scanline_dim  = SliderRow("Oscurecimiento", 0.1, 1.0, 0.55, decimals=2, scale=100)
+        self.s_scanline_step  = SliderRow("Cada N bloques", 0, 10, 2)
+        self.s_scanline_dim   = SliderRow("Oscurecimiento", 0.1, 1.0, 0.55, decimals=2, scale=100)
+        self.s_scanline_width = SliderRow("Grosor (píxeles)", 1, 16, 1)
         gl4.addWidget(self.s_scanline_step)
         gl4.addWidget(self.s_scanline_dim)
+        gl4.addWidget(self.s_scanline_width)
         layout.addWidget(grp_crt)
 
         sep2 = QFrame()
@@ -257,7 +270,8 @@ class PixelArtWindow(QMainWindow):
         for row in [self.s_pixel_block, self.s_color_levels,
                     self.s_saturation, self.s_contrast,
                     self.s_noise_strength, self.s_noise_blue,
-                    self.s_scanline_step, self.s_scanline_dim]:
+                    self.s_scanline_step, self.s_scanline_dim,
+                    self.s_scanline_width]:
             row.slider.valueChanged.connect(self._schedule_preview)
 
         self._load_image()
@@ -334,6 +348,7 @@ class PixelArtWindow(QMainWindow):
             noise_blue     = self.s_noise_blue.value(),
             scanline_step  = int(self.s_scanline_step.value()),
             scanline_dim   = self.s_scanline_dim.value(),
+            scanline_width = max(1, int(self.s_scanline_width.value())),
         )
 
     # ── Acciones ─────────────────────────────────────────────────────────
