@@ -90,7 +90,7 @@ def _process_array(arr, pixel_block, color_levels, saturation, contrast,
     arr = (arr // step) * step
     arr = np.clip(arr, 0, 255 - step)
 
-    # 4. Ruido de color a nivel de bloque
+    # 4. Ruido de color a nivel de bloque, anclado a la paleta
     if noise_strength > 0:
         # Generar ruido a resolución de bloque y escalarlo para que todos los
         # píxeles dentro del mismo bloque reciban el mismo valor de ruido.
@@ -100,7 +100,10 @@ def _process_array(arr, pixel_block, color_levels, saturation, contrast,
         if c == 3:
             noise_small[:, :, 2] *= noise_blue
         noise = np.repeat(np.repeat(noise_small, pixel_block, axis=0), pixel_block, axis=1)
-        arr = np.clip(arr + noise[:h, :w], 0, 255)
+        arr = arr + noise[:h, :w]
+        # Re-cuantizar para que el resultado siga perteneciendo a la paleta
+        arr = (arr // step) * step
+        arr = np.clip(arr, 0, 255 - step)
 
     # 5. Scanlines CRT centradas en los límites entre bloques
     if scanline_step > 0:
