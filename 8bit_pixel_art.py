@@ -20,15 +20,34 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QImage, QPixmap
 from PIL import Image
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 PREVIEW_MAX = 320  # max px for preview thumbnail dimension
 
-# ── Core effect (pure numpy, HWC float32 0–255) ──────────────────────────────
+# ── Normalization ─────────────────────────────────────────────────────────────
+
+def _stretch_to_255(arr):
+    """
+    Stretch a float32 HWC array to the [0, 255] range using percentile clipping.
+    Linear astronomical data lives near 0 in a [0, 1] or [0, 65535] range;
+    a simple *255 multiplication leaves everything black.  Percentile clipping
+    maps the meaningful signal to the full display range, matching what Siril
+    shows on screen.
+    """
+    p_low  = np.percentile(arr, 0.5)
+    p_high = np.percentile(arr, 99.5)
+    if p_high > p_low:
+        arr = np.clip((arr - p_low) / (p_high - p_low) * 255.0, 0, 255)
+    else:
+        arr = np.zeros_like(arr)
+    return arr
+
+
+# ── Core effect (pure numpy, HWC float32 0–255) ───────────────────────────────
 
 def _process_array(arr, pixel_block, color_levels, saturation, contrast,
                    noise_strength, noise_blue, scanline_step, scanline_dim):
-    """Apply the 8-bit effect to a HWC float32 array in the 0–255 range."""
+    """Apply the 8-bit effect to a HWC float32 array already in the 0–255 range."""
     h, w, c = arr.shape
     arr = arr.copy()
 
@@ -68,7 +87,7 @@ def _process_array(arr, pixel_block, color_levels, saturation, contrast,
     return arr
 
 
-# ── Siril integration ──────────────────────────────────────────────────────
+# ── Siril integration ─────────────────────────────────────────────────────────
 
 def apply_8bit_effect(siril, pixel_block, color_levels, saturation, contrast,
                       noise_strength, noise_blue, scanline_step, scanline_dim):
@@ -79,17 +98,19 @@ def apply_8bit_effect(siril, pixel_block, color_levels, saturation, contrast,
 
         siril.log("8-bit Pixel Art: aplicando efecto...")
 
+        # CHW → HWC
         if data.ndim == 3:
             arr = np.transpose(data, (1, 2, 0))
         else:
             arr = data[:, :, np.newaxis]
 
-        if arr.max() <= 1.0:
-            arr = arr * 255.0
+        # Percentile stretch so linear data fills the 0-255 display range
+        arr = _stretch_to_255(arr)
 
         arr = _process_array(arr, pixel_block, color_levels, saturation, contrast,
                              noise_strength, noise_blue, scanline_step, scanline_dim)
 
+        # Back to [0, 1] and CHW
         arr = arr / 255.0
         if data.ndim == 3:
             result = np.transpose(arr, (2, 0, 1))
@@ -108,7 +129,7 @@ def apply_8bit_effect(siril, pixel_block, color_levels, saturation, contrast,
         raise
 
 
-# ── GUI ───────────────────────────────────────────────────────────────
+# ── GUI ───────────────────────────────────────────────────────────────────────
 
 class SliderRow(QWidget):
     def __init__(self, label, min_val, max_val, default, decimals=0, scale=1):
@@ -160,7 +181,7 @@ class PixelArtWindow(QMainWindow):
         root.setSpacing(16)
         root.setContentsMargins(16, 16, 16, 16)
 
-        # ── Left: preview ────────────────────────────────────────────────────
+        # ── Left: preview ──────────────────────────────────────────────────
         self.preview_label = QLabel("Cargando preview...")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setFixedSize(PREVIEW_MAX, PREVIEW_MAX)
@@ -169,7 +190,7 @@ class PixelArtWindow(QMainWindow):
         )
         root.addWidget(self.preview_label, 0)
 
-        # ── Right: controls ───────────────────────────────────────────────
+        # ── Right: controls ────────────────────────────────────────────────
         ctrl = QWidget()
         layout = QVBoxLayout(ctrl)
         layout.setSpacing(10)
@@ -262,24 +283,25 @@ class PixelArtWindow(QMainWindow):
 
         self._load_image()
 
-    # ── Image loading ─────────────────────────────────────────────────────
+    # ── Image loading ──────────────────────────────────────────────────────
 
     def _load_image(self):
         try:
             with self.siril.image_lock():
                 fit = self.siril.get_image(True)
-                self._original_data = fit.data.copy()  # preserve original dtype for undo
+                self._original_data = fit.data.copy()  # original dtype for undo
 
             data_f32 = self._original_data.astype(np.float32)
 
-            # CHW → HWC, normalize to 0-255
+            # CHW → HWC
             if data_f32.ndim == 3:
                 arr = np.transpose(data_f32, (1, 2, 0))
             else:
                 arr = np.stack([data_f32, data_f32, data_f32], axis=2)
 
-            if arr.max() <= 1.0:
-                arr = arr * 255.0
+            # Percentile stretch: maps the real signal to 0-255 regardless of
+            # whether the data is linear [0,1], linear [0,65535], or already stretched
+            arr = _stretch_to_255(arr)
 
             # Downscale to thumbnail
             h, w, _ = arr.shape
@@ -294,7 +316,7 @@ class PixelArtWindow(QMainWindow):
         except Exception as e:
             self.preview_label.setText(f"Preview no disponible:\n{e}")
 
-    # ── Preview ──────────────────────────────────────────────────────────
+    # ── Preview ────────────────────────────────────────────────────────────
 
     def _schedule_preview(self):
         self._preview_timer.start()
@@ -319,7 +341,7 @@ class PixelArtWindow(QMainWindow):
         except Exception as e:
             self.preview_label.setText(f"Error preview:\n{e}")
 
-    # ── Helpers ───────────────────────────────────────────────────────────
+    # ── Helpers ────────────────────────────────────────────────────────────
 
     def _params(self):
         return dict(
@@ -333,7 +355,7 @@ class PixelArtWindow(QMainWindow):
             scanline_dim   = self.s_scanline_dim.value(),
         )
 
-    # ── Actions ───────────────────────────────────────────────────────────
+    # ── Actions ────────────────────────────────────────────────────────────
 
     def apply(self):
         self.btn_apply.setEnabled(False)
@@ -359,7 +381,7 @@ class PixelArtWindow(QMainWindow):
             self.btn_undo.setEnabled(True)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     siril = s.SirilInterface()
