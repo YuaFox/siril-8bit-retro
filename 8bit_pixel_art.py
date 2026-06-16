@@ -76,43 +76,44 @@ def _process_array(arr, pixel_block, color_levels, saturation, contrast,
         arr = gray + (arr - gray) * saturation
     arr = np.clip(arr, 0, 255)
 
-    # 2. Pixelado NEAREST
+    # 2. Downscale a espacio de bloque con PIL NEAREST
     pil_img = Image.fromarray(arr.astype(np.uint8))
     tw, th = max(1, w // pixel_block), max(1, h // pixel_block)
     small = pil_img.resize((tw, th), Image.NEAREST)
-    pixelated = small.resize((w, h), Image.NEAREST)
-    arr = np.array(pixelated, dtype=np.float32)
-    if arr.ndim == 2:                       # PIL colapsa el canal único en mono
-        arr = arr[:, :, np.newaxis]
+    arr_s = np.array(small, dtype=np.float32)
+    if arr_s.ndim == 2:                       # PIL colapsa el canal único en mono
+        arr_s = arr_s[:, :, np.newaxis]
 
-    # 3. Cuantización de color
+    # 3. Cuantización de color en espacio de bloque
     step = 256 // color_levels
-    arr = (arr // step) * step
-    arr = np.clip(arr, 0, 255 - step)
+    arr_s = (arr_s // step) * step
+    arr_s = np.clip(arr_s, 0, 255 - step)
 
-    # 4. Ruido de color a nivel de bloque, anclado a la paleta
+    # 4. Ruido en espacio de bloque: un valor por bloque, anclado a la paleta.
+    #    Al estar en espacio de bloque, cada elemento ya representa un bloque entero.
     if noise_strength > 0:
-        # Generar ruido a resolución de bloque y escalarlo para que todos los
-        # píxeles dentro del mismo bloque reciban el mismo valor de ruido.
-        nh = (h + pixel_block - 1) // pixel_block
-        nw = (w + pixel_block - 1) // pixel_block
-        noise_small = np.random.normal(0, noise_strength, (nh, nw, c)).astype(np.float32)
+        noise_s = np.random.normal(0, noise_strength, arr_s.shape).astype(np.float32)
         if c == 3:
-            noise_small[:, :, 2] *= noise_blue
-        noise = np.repeat(np.repeat(noise_small, pixel_block, axis=0), pixel_block, axis=1)
-        arr = arr + noise[:h, :w]
-        # Re-cuantizar para que el resultado siga perteneciendo a la paleta
-        arr = (arr // step) * step
-        arr = np.clip(arr, 0, 255 - step)
+            noise_s[:, :, 2] *= noise_blue
+        arr_s = arr_s + noise_s
+        arr_s = (arr_s // step) * step
+        arr_s = np.clip(arr_s, 0, 255 - step)
 
-    # 5. Scanlines CRT centradas en los límites entre bloques
+    # 5. Upscale con np.repeat: cada bloque ocupa exactamente pixel_block píxeles.
+    #    A diferencia de PIL resize, los límites de bloque quedan en múltiplos exactos.
+    arr = np.repeat(np.repeat(arr_s, pixel_block, axis=0), pixel_block, axis=1)
+    ph, pw = arr.shape[0], arr.shape[1]
+    if ph < h or pw < w:
+        arr = np.pad(arr, ((0, max(0, h - ph)), (0, max(0, w - pw)), (0, 0)), mode='edge')
+    arr = arr[:h, :w]
+
+    # 6. Scanlines en espacio de pantalla centradas en los límites exactos de bloque
     if scanline_step > 0:
         half_t = scanline_width // 2
         rest_t = scanline_width - half_t
-        boundary_step = pixel_block * scanline_step
-        for b in range(pixel_block, h + pixel_block, boundary_step):
+        for b in range(pixel_block, h, pixel_block * scanline_step):
             y_start = max(0, b - half_t)
-            y_end = min(h, b + rest_t)
+            y_end   = min(h, b + rest_t)
             if y_start < y_end:
                 arr[y_start:y_end, :] *= scanline_dim
 
